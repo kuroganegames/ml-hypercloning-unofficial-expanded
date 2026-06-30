@@ -2,59 +2,53 @@
 # For licensing see accompanying LICENSE file.
 # Copyright (C) 2020 Apple Inc. All Rights Reserved.
 #
+"""HyperCloning public API."""
 
-from hf_olmo.configuration_olmo import OLMoConfig
-from transformers import (Gemma2Config, GemmaConfig, GPTNeoXConfig,
-                          LlamaConfig, OPTConfig, Qwen3Config)
+from __future__ import annotations
 
-from hypercloning.gemma_cloning import clone_gemma, clone_gemma2
-from hypercloning.llama_cloning import clone_llama
-from hypercloning.olmo_cloning import clone_olmo
-from hypercloning.opt_cloning import clone_opt
-from hypercloning.pythia_cloning import clone_pythia
-from hypercloning.qwen3_cloning import clone_qwen3
+from importlib import import_module
 
-REGISTERED_CLONING_FUNCTIONS = {
-    "LlamaConfig": clone_llama,
-    "GemmaConfig": clone_gemma,
-    "Gemma2Config": clone_gemma2,
-    "OPTConfig": clone_opt,
-    "OLMoConfig": clone_olmo,
-    "GPTNeoXConfig": clone_pythia,
-    "Qwen3Config": clone_qwen3,
-}
+from hypercloning.clone_api import CloneFunction, CloneRequest, CloneResult, call_legacy_clone_function, normalize_clone_output
+from hypercloning.registry import (
+    REGISTERED_CLONING_FUNCTIONS,
+    REGISTERED_IMPORT_ERRORS,
+    REGISTRATION_ERRORS,
+    clone_model,
+    get_cloning_function,
+    register_cloning_function,
+    unregister_cloning_function,
+)
+from hypercloning.trace import CloneOp, CloneTrace
 
 
-def cloneModel(
-    model, embedding_dim_multiplier: int, up_project_multiplier: int, **kwargs
-):
-    """
-    Expand 'model' according to 'embedding_dim_multiplier' and
-    'up_project_multiplier'.
+def _register_optional_cloner(error_key: str, config_module: str, config_name: str, cloner_module: str, cloner_name: str) -> None:
+    try:
+        config_cls = getattr(import_module(config_module), config_name)
+        clone_fn = getattr(import_module(cloner_module), cloner_name)
+    except Exception as exc:  # pragma: no cover - optional dependency dependent
+        REGISTERED_IMPORT_ERRORS[error_key] = repr(exc)
+    else:
+        register_cloning_function(config_cls.__name__, clone_fn)
 
-    Arguments:
-        embedding_dim_multiplier:
-            Expansion factor for embedding size.
-        up_project_multiplier:
-            Expansion factor for the FFN layers.
-        kwargs can include:
-            snr_db:
-                Signal to noise ratio in decibels if noise is desired to be
-                added to the weight tensors. Defaults to None.
-            up_project_multiplier:
-                The ratio of the number of heads in the destination network
-                divided by the number of heads in the source network.
-                Defaults to 'embedding_dim_multiplier' (recommended).
 
-    Returns:
-        Cloned model with expanded parameters.
-    """
-    cloning_function_key = str(type(model.config)).split(".")[-1][:-2].strip()
+def _try_register_builtin_cloners() -> None:
+    for spec in (
+        ("llama", "transformers", "LlamaConfig", "hypercloning.llama_cloning", "clone_llama"),
+        ("gemma", "transformers", "GemmaConfig", "hypercloning.gemma_cloning", "clone_gemma"),
+        ("gemma2", "transformers", "Gemma2Config", "hypercloning.gemma_cloning", "clone_gemma2"),
+        ("opt", "transformers", "OPTConfig", "hypercloning.opt_cloning", "clone_opt"),
+        ("pythia", "transformers", "GPTNeoXConfig", "hypercloning.pythia_cloning", "clone_pythia"),
+        ("qwen3", "transformers", "Qwen3Config", "hypercloning.qwen3_cloning", "clone_qwen3"),
+        ("olmo", "hf_olmo.configuration_olmo", "OLMoConfig", "hypercloning.olmo_cloning", "clone_olmo"),
+    ):
+        _register_optional_cloner(*spec)
 
-    assert (
-        cloning_function_key in REGISTERED_CLONING_FUNCTIONS
-    ), f"cloning is not supported for model config of type {cloning_function_key}"
-    cloning_function = REGISTERED_CLONING_FUNCTIONS[cloning_function_key]
+
+_try_register_builtin_cloners()
+
+
+def cloneModel(model, embedding_dim_multiplier: int, up_project_multiplier: int, **kwargs):
+    cloning_function = get_cloning_function(model)
     print(f"cloning the network using {cloning_function} ...")
     return cloning_function(
         model,
@@ -62,3 +56,34 @@ def cloneModel(
         up_project_multiplier=up_project_multiplier,
         **kwargs,
     )
+
+
+def cloneModelWithResult(model, embedding_dim_multiplier: int, up_project_multiplier: int, **kwargs) -> CloneResult:
+    output = cloneModel(model, embedding_dim_multiplier, up_project_multiplier, **kwargs)
+    return normalize_clone_output(
+        output,
+        embedding_dim_multiplier=embedding_dim_multiplier,
+        up_project_multiplier=up_project_multiplier,
+        num_heads_multiplier=kwargs.get("num_heads_multiplier", embedding_dim_multiplier),
+        snr_db=kwargs.get("snr_db"),
+    )
+
+
+__all__ = [
+    "CloneFunction",
+    "CloneOp",
+    "CloneRequest",
+    "CloneResult",
+    "CloneTrace",
+    "REGISTERED_CLONING_FUNCTIONS",
+    "REGISTERED_IMPORT_ERRORS",
+    "REGISTRATION_ERRORS",
+    "call_legacy_clone_function",
+    "cloneModel",
+    "clone_model",
+    "cloneModelWithResult",
+    "get_cloning_function",
+    "normalize_clone_output",
+    "register_cloning_function",
+    "unregister_cloning_function",
+]
