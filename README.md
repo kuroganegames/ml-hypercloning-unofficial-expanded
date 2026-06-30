@@ -1,4 +1,16 @@
-# HyperCloning
+# ml-hypercloning-unofficial
+
+> [!WARNING]
+> This is an **unofficial, community-maintained derivative** of
+> [apple/ml-hypercloning](https://github.com/apple/ml-hypercloning).
+>
+> This repository is **not affiliated with, endorsed by, or maintained by Apple**.
+> Apple, MLX, and related names are trademarks of their respective owners.
+
+This repository is based on Apple’s `ml-hypercloning` project and includes
+additional local modifications for experimental/self-hosted use.
+
+## HyperCloning
 
 This software project accompanies the research paper, [Scaling Smart: Accelerating Large Language Model Pre-training with Small Model Initialization](https://arxiv.org/abs/2409.12903).
 
