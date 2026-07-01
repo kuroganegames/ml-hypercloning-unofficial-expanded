@@ -10,7 +10,7 @@ import torch
 
 from hc_validate import ValidationReport, ValidationSpec, tensor_diff
 from hc_validate.generation import GenerationCacheSpec, run_generation_cache_check
-from hc_validate.inputs import infer_pad_token_id, infer_vocab_size
+from hc_validate.inputs import InputMatrixSpec, infer_pad_token_id, infer_vocab_size
 
 MaskPattern = Literal[
     "no_padding",
@@ -79,9 +79,7 @@ def _accepted_kwargs(callable_obj: Any) -> set[str]:
 
 def _filter_forward_kwargs(model: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     accepted = _accepted_kwargs(model.forward)
-    if not accepted:
-        return kwargs
-    return {key: value for key, value in kwargs.items() if key in accepted}
+    return kwargs if not accepted else {key: value for key, value in kwargs.items() if key in accepted}
 
 
 def _move_batch(batch: dict[str, torch.Tensor], device: str) -> dict[str, torch.Tensor]:
@@ -182,9 +180,7 @@ def _make_pattern_batch(
         if pad_len:
             input_ids[:, :pad_len] = pad_token_id
             attention_mask[:, :pad_len] = 0
-    elif pattern == "sliding_window_boundary":
-        pass
-    elif pattern == "no_padding":
+    elif pattern in {"sliding_window_boundary", "no_padding"}:
         pass
     else:
         raise ValueError(f"Unsupported long-context pattern: {pattern}")
@@ -206,14 +202,11 @@ def make_long_context_bundles(
 ) -> list[LongContextBundle]:
     spec = spec or LongContextSpec()
     vocab_size = infer_vocab_size(tokenizer, config)
-    pad_token_id = infer_pad_token_id(tokenizer, None) if tokenizer is not None else 0
-    if tokenizer is None:
-        pad_token_id = 0
+    pad_token_id = infer_pad_token_id(tokenizer, InputMatrixSpec()) if tokenizer is not None else 0
     generator = torch.Generator(device="cpu")
     generator.manual_seed(spec.seed)
-    lengths = infer_context_lengths(config, spec)
     bundles: list[LongContextBundle] = []
-    for length in lengths:
+    for length in infer_context_lengths(config, spec):
         for pattern in spec.patterns:
             if pattern == "sliding_window_boundary" and _get_config_int(config, ("sliding_window",)) is None:
                 continue
@@ -246,10 +239,8 @@ def _select_last_nonpad(logits: torch.Tensor, attention_mask: torch.Tensor | Non
 
 
 def _select_positions(logits: torch.Tensor, positions: tuple[int, ...]) -> torch.Tensor:
-    if not positions:
-        return logits[:, -1:, :]
-    resolved = []
     length = logits.shape[1]
+    resolved = []
     for pos in positions:
         value = length + pos if pos < 0 else pos
         if 0 <= value < length:
@@ -279,12 +270,7 @@ def _compare_selected_logits(
 
     for name, src, dst in selections:
         diff = tensor_diff(src, dst)
-        report.metrics[name] = {
-            "max_abs": diff.max_abs,
-            "mean_abs": diff.mean_abs,
-            "rel_l2": diff.rel_l2,
-            "cosine": diff.cosine,
-        }
+        report.metrics[name] = {"max_abs": diff.max_abs, "mean_abs": diff.mean_abs, "rel_l2": diff.rel_l2, "cosine": diff.cosine}
         if diff.max_abs > spec.atol and diff.rel_l2 > spec.rtol:
             report.fail(f"{bundle.name}.{name}: logits mismatch max_abs={diff.max_abs:.3g} rel_l2={diff.rel_l2:.3g}")
     return report
@@ -304,7 +290,7 @@ def validate_long_context_bundle(
     source_model.eval().to(base_spec.device)
     destination_model.eval().to(base_spec.device)
 
-    src_kwargs = {
+    kwargs = {
         "input_ids": batch["input_ids"],
         "attention_mask": batch.get("attention_mask"),
         "position_ids": batch.get("position_ids"),
@@ -314,22 +300,19 @@ def validate_long_context_bundle(
         "output_hidden_states": False,
         "output_attentions": False,
     }
-    dst_kwargs = dict(src_kwargs)
-    src_kwargs = {key: value for key, value in src_kwargs.items() if value is not None}
-    dst_kwargs = {key: value for key, value in dst_kwargs.items() if value is not None}
+    kwargs = {key: value for key, value in kwargs.items() if value is not None}
 
-    if "position_ids" in batch:
+    if "position_ids" in kwargs:
         if "position_ids" not in _accepted_kwargs(source_model.forward) or "position_ids" not in _accepted_kwargs(destination_model.forward):
             message = "explicit position_ids requested but source or destination forward does not accept position_ids"
             if spec.require_position_ids_support:
                 report.fail(message)
             else:
                 report.warnings.append(message)
-            src_kwargs.pop("position_ids", None)
-            dst_kwargs.pop("position_ids", None)
+            kwargs.pop("position_ids", None)
 
-    src_out = source_model(**_filter_forward_kwargs(source_model, src_kwargs))
-    dst_out = destination_model(**_filter_forward_kwargs(destination_model, dst_kwargs))
+    src_out = source_model(**_filter_forward_kwargs(source_model, kwargs))
+    dst_out = destination_model(**_filter_forward_kwargs(destination_model, kwargs))
     src_logits = _get_output_attr(src_out, "logits")
     dst_logits = _get_output_attr(dst_out, "logits")
     if src_logits is None or dst_logits is None:
@@ -355,9 +338,8 @@ def run_long_context_check(
     if not long_spec.enabled:
         report.warnings.append("long-context check disabled")
         return report
-    config = getattr(source_model, "config", None)
     try:
-        bundles = make_long_context_bundles(tokenizer, config, long_spec)
+        bundles = make_long_context_bundles(tokenizer, getattr(source_model, "config", None), long_spec)
     except Exception as exc:
         report.fail(f"failed to construct long-context bundles: {type(exc).__name__}: {exc}")
         return report
@@ -370,8 +352,11 @@ def run_long_context_check(
 
     if long_spec.run_generation_cache_at_long_context and generation_spec is not None:
         generation_spec = GenerationCacheSpec(**{**generation_spec.__dict__, "max_new_tokens": long_spec.generation_max_new_tokens})
-        candidate_batches = [bundle.batch for bundle in bundles if bundle.pattern in {"left_padding", "explicit_position_ids", "sliding_window_boundary", "no_padding"}]
-        candidate_batches = candidate_batches[: long_spec.max_generation_bundles]
+        candidate_batches = [
+            bundle.batch
+            for bundle in bundles
+            if bundle.pattern in {"left_padding", "explicit_position_ids", "sliding_window_boundary", "no_padding"}
+        ][: long_spec.max_generation_bundles]
         if candidate_batches:
             child = run_generation_cache_check(source_model, destination_model, candidate_batches, base_spec, generation_spec)
             _merge_child(report, "generation_at_long_context", child)
