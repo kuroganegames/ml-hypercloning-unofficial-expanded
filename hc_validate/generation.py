@@ -7,7 +7,7 @@ They validate generation/cache behavior through public ``forward`` and optional
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import inspect
 from typing import Any
 
@@ -61,18 +61,28 @@ def _merge_child(parent: ValidationReport, prefix: str, child: ValidationReport)
         parent.fail(f"{prefix}: {failure}")
 
 
-def _accepted_kwargs(callable_obj: Any) -> set[str]:
+def _signature(callable_obj: Any) -> inspect.Signature | None:
     try:
-        return set(inspect.signature(callable_obj).parameters)
+        return inspect.signature(callable_obj)
     except Exception:
-        return set()
+        return None
+
+
+def _accepted_kwargs(callable_obj: Any) -> set[str]:
+    sig = _signature(callable_obj)
+    return set(sig.parameters) if sig is not None else set()
+
+
+def _accepts_var_kwargs(callable_obj: Any) -> bool:
+    sig = _signature(callable_obj)
+    if sig is None:
+        return True
+    return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values())
 
 
 def _filter_forward_kwargs(model: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
     accepted = _accepted_kwargs(model.forward)
-    if not accepted:
-        return kwargs
-    return {key: value for key, value in kwargs.items() if key in accepted}
+    return kwargs if not accepted else {key: value for key, value in kwargs.items() if key in accepted}
 
 
 def _move_batch(batch: dict[str, torch.Tensor], device: str) -> dict[str, torch.Tensor]:
@@ -175,8 +185,7 @@ def manual_cache_loop(
 
     extended_mask = attention_mask
     for step in range(steps):
-        decode_mask = torch.ones_like(next_token)
-        extended_mask = torch.cat([extended_mask, decode_mask], dim=-1)
+        extended_mask = torch.cat([extended_mask, torch.ones_like(next_token)], dim=-1)
         decode_kwargs = {
             "input_ids": next_token,
             "attention_mask": extended_mask,
@@ -193,7 +202,6 @@ def manual_cache_loop(
         past = _get_output_attr(out, "past_key_values")
         logits_per_step.append(step_logits[:, -1, :])
         generated_tokens.append(next_token)
-
         if forced_tokens is not None and step + 1 < forced_tokens.shape[1]:
             next_token = forced_tokens[:, step + 1 : step + 2].to(device)
         else:
@@ -236,8 +244,7 @@ def _run_no_cache_vs_cache(
         attention_mask = torch.ones_like(input_ids)
     for step in range(loop.tokens.shape[1]):
         prefix = torch.cat([input_ids, loop.tokens[:, : step + 1].to(input_ids.device)], dim=-1)
-        extra_mask = torch.ones_like(loop.tokens[:, : step + 1]).to(attention_mask.device)
-        prefix_mask = torch.cat([attention_mask, extra_mask], dim=-1)
+        prefix_mask = torch.cat([attention_mask, torch.ones_like(loop.tokens[:, : step + 1]).to(attention_mask.device)], dim=-1)
         full_logits = _full_forward_last_logits(model, prefix, prefix_mask, base_spec.device)
         cache_logits = loop.logits[step + 1]
         child = _compare_logits(f"{label}.no_cache_vs_cache.step{step}", full_logits, cache_logits, spec)
@@ -265,11 +272,11 @@ def _call_generate(model: Any, batch: dict[str, torch.Tensor], spec: GenerationC
     if not hasattr(model, "generate"):
         return None, "model does not implement generate"
     kwargs = _generate_kwargs(spec)
-    allowed = _accepted_kwargs(model.generate)
-    if allowed:
-        call_kwargs = {key: value for key, value in kwargs.items() if key in allowed or key in {"max_new_tokens", "do_sample", "num_beams"}}
+    if _accepts_var_kwargs(model.generate):
+        call_kwargs = dict(kwargs)
     else:
-        call_kwargs = kwargs
+        allowed = _accepted_kwargs(model.generate)
+        call_kwargs = {key: value for key, value in kwargs.items() if key in allowed}
     model_inputs = {key: value for key, value in batch.items() if key in {"input_ids", "attention_mask"}}
     try:
         return model.generate(**model_inputs, **call_kwargs), None
@@ -336,10 +343,9 @@ def run_generate_compare(
         report.metrics["generate_logits_kind"] = {"source": src_kind, "destination": dst_kind}
         if src_kind != dst_kind:
             report.warnings.append(f"generate output kind mismatch: source={src_kind} destination={dst_kind}")
-        if src_logits and dst_logits:
-            for step, (src_step, dst_step) in enumerate(zip(src_logits, dst_logits)):
-                child = _compare_logits(f"generate.step{step}", src_step, dst_step, spec)
-                _merge_child(report, f"step{step}", child)
+        for step, (src_step, dst_step) in enumerate(zip(src_logits, dst_logits)):
+            child = _compare_logits(f"generate.step{step}", src_step, dst_step, spec)
+            _merge_child(report, f"step{step}", child)
     return report
 
 
@@ -376,10 +382,8 @@ def run_manual_cache_compare(
         _merge_child(report, f"step{step}", child)
 
     if spec.run_no_cache_vs_cache:
-        src_child = _run_no_cache_vs_cache(source_model, batch, src_loop, spec, base_spec, "source")
-        dst_child = _run_no_cache_vs_cache(destination_model, batch, dst_loop, spec, base_spec, "destination")
-        _merge_child(report, "source_no_cache_vs_cache", src_child)
-        _merge_child(report, "destination_no_cache_vs_cache", dst_child)
+        _merge_child(report, "source_no_cache_vs_cache", _run_no_cache_vs_cache(source_model, batch, src_loop, spec, base_spec, "source"))
+        _merge_child(report, "destination_no_cache_vs_cache", _run_no_cache_vs_cache(destination_model, batch, dst_loop, spec, base_spec, "destination"))
     return report
 
 
@@ -398,9 +402,7 @@ def run_generation_cache_check(
     selected = batches if spec.num_prompt_batches is None else batches[: spec.num_prompt_batches]
     for batch_index, batch in enumerate(selected):
         if spec.run_generate:
-            child = run_generate_compare(source_model, destination_model, batch, base_spec, spec)
-            _merge_child(report, f"batch{batch_index}.generate", child)
+            _merge_child(report, f"batch{batch_index}.generate", run_generate_compare(source_model, destination_model, batch, base_spec, spec))
         if spec.run_manual_cache_loop:
-            child = run_manual_cache_compare(source_model, destination_model, batch, base_spec, spec)
-            _merge_child(report, f"batch{batch_index}.manual_cache", child)
+            _merge_child(report, f"batch{batch_index}.manual_cache", run_manual_cache_compare(source_model, destination_model, batch, base_spec, spec))
     return report
