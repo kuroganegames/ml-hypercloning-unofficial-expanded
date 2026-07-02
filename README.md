@@ -58,6 +58,8 @@ This fork includes validation helpers for implementing HyperCloning support for 
 
 At a high level, the validator checks `forward()`, `config`, `state_dict()`, and optional `CloneTrace` metadata. The main validation target is clone-time function preservation: source and destination logits should match immediately after cloning, up to expected numerical precision.
 
+To run the full validation stack on an already cloned source/destination pair, use `python -m hc_validate.run_all` or `python scripts/run_all_validations.py`. See [docs/RUN_ALL_VALIDATIONS.md](docs/RUN_ALL_VALIDATIONS.md) for examples and output descriptions.
+
 ## Limitations
 - The current implementation requires `embedding_dim_multiplier` and `up_project_multiplier` to be integers. fractional values are not supported.
 - Although the destination network's output is valid, it may not be perfectly aligned with the source network. This can happen due to numerical precision issues.
