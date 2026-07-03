@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from hypercloning.common import clone_matrix, clone_vector
 from hypercloning.trace import CloneTrace
+from hc_validate.model_loading import maybe_move_model, move_batch_to_model
 
 
 @dataclass
@@ -51,8 +52,8 @@ class ValidationReport:
 
 
 def tensor_diff(a: torch.Tensor, b: torch.Tensor) -> TensorDiff:
-    a = a.detach().float()
-    b = b.detach().float()
+    a = a.detach().float().cpu()
+    b = b.detach().float().cpu()
     d = a - b
     denom = torch.linalg.vector_norm(a).clamp_min(1e-12)
     cosine = None if a.numel() == 0 else float(F.cosine_similarity(a.flatten(), b.flatten(), dim=0).item())
@@ -100,15 +101,16 @@ def compare_repeated_hidden(src: torch.Tensor, dst: torch.Tensor, repeat: int) -
 @torch.inference_mode()
 def validate_forward(source_model, destination_model, batches: list[dict[str, torch.Tensor]], spec: ValidationSpec) -> ValidationReport:
     report = ValidationReport()
-    source_model.eval().to(spec.device)
-    destination_model.eval().to(spec.device)
+    maybe_move_model(source_model, spec.device)
+    maybe_move_model(destination_model, spec.device)
     logits_diffs = []
     loss_diffs = []
     hidden_diffs = []
     for batch_i, batch in enumerate(batches):
-        batch = {k: v.to(spec.device) for k, v in batch.items()}
-        src_out = source_model(**(_filter_kwargs(source_model, batch) | _forward_flags(source_model, hidden=spec.compare_hidden_states)))
-        dst_out = destination_model(**(_filter_kwargs(destination_model, batch) | _forward_flags(destination_model, hidden=spec.compare_hidden_states)))
+        src_batch = move_batch_to_model(batch, source_model, fallback=spec.device)
+        dst_batch = move_batch_to_model(batch, destination_model, fallback=spec.device)
+        src_out = source_model(**(_filter_kwargs(source_model, src_batch) | _forward_flags(source_model, hidden=spec.compare_hidden_states)))
+        dst_out = destination_model(**(_filter_kwargs(destination_model, dst_batch) | _forward_flags(destination_model, hidden=spec.compare_hidden_states)))
         if not hasattr(src_out, 'logits') or not hasattr(dst_out, 'logits'):
             report.fail('ModelOutput missing logits')
             continue
@@ -117,7 +119,7 @@ def validate_forward(source_model, destination_model, batches: list[dict[str, to
         if diff.max_abs > spec.atol and diff.rel_l2 > spec.rtol:
             report.fail(f'batch={batch_i}: logits mismatch max_abs={diff.max_abs:.3g} rel_l2={diff.rel_l2:.3g}')
         if getattr(src_out, 'loss', None) is not None and getattr(dst_out, 'loss', None) is not None:
-            loss_diffs.append(float((src_out.loss - dst_out.loss).abs().item()))
+            loss_diffs.append(float((src_out.loss.detach().float().cpu() - dst_out.loss.detach().float().cpu()).abs().item()))
         src_hs = getattr(src_out, 'hidden_states', None)
         dst_hs = getattr(dst_out, 'hidden_states', None)
         if spec.compare_hidden_states and src_hs is not None and dst_hs is not None:

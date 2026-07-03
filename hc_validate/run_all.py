@@ -9,7 +9,7 @@ individual reports plus a summary.
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +17,7 @@ from hc_validate import ValidationReport, ValidationSpec
 from hc_validate.generation import GenerationCacheSpec
 from hc_validate.inputs import InputMatrixSpec
 from hc_validate.long_context import LongContextSpec
+from hc_validate.model_loading import ModelLoadSpec, load_hf_causal_lm, load_json_arg
 from hc_validate.p1_suite import P1ValidationSpec, run_p1_validation
 from hc_validate.reporting import save_report_bundle, summarize_reports, write_json
 from hc_validate.serialization import SaveReloadSpec
@@ -52,6 +53,15 @@ def _parse_int_tuple(value: str | None) -> tuple[int, ...] | None:
     if value is None or value == "":
         return None
     return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _none_if_empty(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if value == "" or value.lower() in {"none", "null"}:
+        return None
+    return value
 
 
 def _get_config_value(config: Any | None, logical_key: str) -> int | None:
@@ -127,51 +137,13 @@ def infer_validation_spec(
     )
 
 
-def torch_dtype_from_name(name: str | None):
-    if name is None or name.lower() in {"auto", "none"}:
-        return "auto"
-    import torch
-
-    aliases = {
-        "float32": torch.float32,
-        "fp32": torch.float32,
-        "bfloat16": torch.bfloat16,
-        "bf16": torch.bfloat16,
-        "float16": torch.float16,
-        "fp16": torch.float16,
-    }
-    key = name.lower()
-    if key not in aliases:
-        raise ValueError(f"Unsupported dtype {name!r}")
-    return aliases[key]
-
-
-def load_hf_causal_lm(
-    model_id_or_path: str,
-    *,
-    device: str = "cpu",
-    dtype: str | None = "auto",
-    trust_remote_code: bool = False,
-    revision: str | None = None,
-):
-    from transformers import AutoModelForCausalLM
-
-    kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
-    if revision:
-        kwargs["revision"] = revision
-    torch_dtype = torch_dtype_from_name(dtype)
-    if torch_dtype != "auto":
-        kwargs["torch_dtype"] = torch_dtype
-    model = AutoModelForCausalLM.from_pretrained(model_id_or_path, **kwargs)
-    return model.to(device) if hasattr(model, "to") else model
-
-
 def load_tokenizer_optional(
     tokenizer_id_or_path: str | None,
     *,
     fallback_id_or_path: str | None = None,
     trust_remote_code: bool = False,
     revision: str | None = None,
+    local_files_only: bool = False,
 ):
     target = tokenizer_id_or_path or fallback_id_or_path
     if not target:
@@ -179,7 +151,7 @@ def load_tokenizer_optional(
     try:
         from transformers import AutoTokenizer
 
-        kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code}
+        kwargs: dict[str, Any] = {"trust_remote_code": trust_remote_code, "local_files_only": local_files_only}
         if revision:
             kwargs["revision"] = revision
         return AutoTokenizer.from_pretrained(target, **kwargs)
@@ -268,18 +240,85 @@ def run_all_validations(
     return AllValidationResult(reports=reports, summary=summary, output_dir=str(spec.output_dir) if spec.output_dir else None)
 
 
+def _profile_defaults(profile: str, prefix: str) -> dict[str, Any]:
+    if profile == "single-gpu":
+        return {"device": "cuda"}
+    if profile == "auto-sharded":
+        return {"device_map": "auto", "low_cpu_mem_usage": True}
+    if profile == "cpu-offload":
+        return {
+            "device_map": "auto",
+            "low_cpu_mem_usage": True,
+            "offload_state_dict": True,
+            "offload_folder": f"./offload/{prefix}",
+        }
+    if profile == "cpu":
+        return {"device": "cpu"}
+    return {}
+
+
+def build_model_load_spec(args: argparse.Namespace, prefix: str) -> ModelLoadSpec:
+    defaults = _profile_defaults(args.load_profile, prefix)
+    explicit_device = _none_if_empty(getattr(args, f"{prefix}_device"))
+    explicit_device_map = _none_if_empty(getattr(args, f"{prefix}_device_map"))
+
+    device_map = explicit_device_map if explicit_device_map is not None else defaults.get("device_map")
+    device = explicit_device if explicit_device is not None else defaults.get("device", args.device)
+    if device_map is not None:
+        device = None
+
+    low_cpu_mem_usage = bool(defaults.get("low_cpu_mem_usage", False) or getattr(args, f"{prefix}_low_cpu_mem_usage"))
+    offload_state_dict = bool(defaults.get("offload_state_dict", False) or getattr(args, f"{prefix}_offload_state_dict"))
+    offload_folder = _none_if_empty(getattr(args, f"{prefix}_offload_folder")) or defaults.get("offload_folder")
+    max_memory = load_json_arg(getattr(args, f"{prefix}_max_memory_json"))
+    extra_kwargs = load_json_arg(getattr(args, f"{prefix}_extra_kwargs_json")) or {}
+
+    return ModelLoadSpec(
+        trust_remote_code=args.trust_remote_code,
+        revision=getattr(args, f"{prefix}_revision"),
+        dtype=args.dtype,
+        device=device,
+        device_map=device_map,
+        max_memory=max_memory,
+        low_cpu_mem_usage=low_cpu_mem_usage,
+        offload_folder=offload_folder,
+        offload_state_dict=offload_state_dict,
+        attn_implementation=_none_if_empty(args.attn_implementation),
+        local_files_only=args.local_files_only,
+        extra_kwargs=extra_kwargs,
+    )
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run all HyperCloning validation suites on source and cloned models.")
     parser.add_argument("--source-model", required=True, help="HF model ID or local directory for the source model")
     parser.add_argument("--cloned-model", required=True, help="HF model ID or local directory for the already cloned model")
     parser.add_argument("--tokenizer", default=None, help="Optional tokenizer ID/path. Defaults to --source-model")
     parser.add_argument("--output-dir", required=True, help="Directory where validation reports will be written")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="cpu", help="Backward-compatible single-device fallback")
     parser.add_argument("--dtype", default="auto", help="auto, fp32, bf16, or fp16")
     parser.add_argument("--trust-remote-code", action="store_true")
+    parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--attn-implementation", default=None, help="Optional Transformers attention implementation, e.g. eager")
+    parser.add_argument("--load-profile", choices=("default", "single-gpu", "auto-sharded", "cpu-offload", "cpu"), default="default")
     parser.add_argument("--source-revision", default=None)
     parser.add_argument("--cloned-revision", default=None)
     parser.add_argument("--tokenizer-revision", default=None)
+
+    parser.add_argument("--source-device", default=None)
+    parser.add_argument("--cloned-device", default=None)
+    parser.add_argument("--source-device-map", default=None)
+    parser.add_argument("--cloned-device-map", default=None)
+    parser.add_argument("--source-max-memory-json", default=None, help="Inline JSON or @path max_memory for source model")
+    parser.add_argument("--cloned-max-memory-json", default=None, help="Inline JSON or @path max_memory for cloned model")
+    parser.add_argument("--source-low-cpu-mem-usage", action="store_true")
+    parser.add_argument("--cloned-low-cpu-mem-usage", action="store_true")
+    parser.add_argument("--source-offload-folder", default=None)
+    parser.add_argument("--cloned-offload-folder", default=None)
+    parser.add_argument("--source-offload-state-dict", action="store_true")
+    parser.add_argument("--cloned-offload-state-dict", action="store_true")
+    parser.add_argument("--source-extra-kwargs-json", default=None, help="Inline JSON or @path extra kwargs for source from_pretrained")
+    parser.add_argument("--cloned-extra-kwargs-json", default=None, help="Inline JSON or @path extra kwargs for cloned from_pretrained")
 
     parser.add_argument("--embedding-dim-multiplier", type=int, default=None)
     parser.add_argument("--up-project-multiplier", type=int, default=None)
@@ -308,25 +347,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_arg_parser().parse_args(argv)
-    source_model = load_hf_causal_lm(
-        args.source_model,
-        device=args.device,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        revision=args.source_revision,
-    )
-    cloned_model = load_hf_causal_lm(
-        args.cloned_model,
-        device=args.device,
-        dtype=args.dtype,
-        trust_remote_code=args.trust_remote_code,
-        revision=args.cloned_revision,
-    )
+    source_load_spec = build_model_load_spec(args, "source")
+    cloned_load_spec = build_model_load_spec(args, "cloned")
+
+    source_model = load_hf_causal_lm(args.source_model, source_load_spec)
+    cloned_model = load_hf_causal_lm(args.cloned_model, cloned_load_spec)
     tokenizer = load_tokenizer_optional(
         args.tokenizer,
         fallback_id_or_path=args.source_model,
         trust_remote_code=args.trust_remote_code,
         revision=args.tokenizer_revision or args.source_revision,
+        local_files_only=args.local_files_only,
     )
 
     base_spec, inference_warnings = infer_validation_spec(
@@ -349,6 +380,11 @@ def main(argv: list[str] | None = None) -> int:
         "device": args.device,
         "dtype": args.dtype,
         "trust_remote_code": args.trust_remote_code,
+        "load_profile": args.load_profile,
+        "source_load_spec": asdict(source_load_spec),
+        "cloned_load_spec": asdict(cloned_load_spec),
+        "source_hf_device_map": getattr(source_model, "hf_device_map", None),
+        "cloned_hf_device_map": getattr(cloned_model, "hf_device_map", None),
         "embedding_dim_multiplier": base_spec.embedding_dim_multiplier,
         "up_project_multiplier": base_spec.up_project_multiplier,
         "num_heads_multiplier": base_spec.num_heads_multiplier,
