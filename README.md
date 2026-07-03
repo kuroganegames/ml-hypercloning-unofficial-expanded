@@ -49,7 +49,8 @@ The following families of models are currently supported:
 - [Pythia](https://huggingface.co/models?other=pythia)
 - [OLMo](https://huggingface.co/docs/transformers/en/model_doc/olmo)
 - [Gemma](https://huggingface.co/docs/transformers/en/model_doc/gemma)
-- [Llama](https://huggingface.co/docs/transformers/en/model_doc/llama2)
+- [Llama / Llama2 / Llama3](https://huggingface.co/docs/transformers/en/model_doc/llama)
+  - Llama3 compatibility is covered by tiny synthetic validation tests. For gated or local Llama3 checkpoints, see [docs/LLAMA3_VALIDATION.md](docs/LLAMA3_VALIDATION.md).
 - [Qwen3 dense](https://huggingface.co/docs/transformers/en/model_doc/qwen3)
 
 ## Architecture-independent validation
