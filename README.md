@@ -52,6 +52,8 @@ The following families of models are currently supported:
 - [Llama / Llama2 / Llama3](https://huggingface.co/docs/transformers/en/model_doc/llama)
   - Llama3 compatibility is covered by tiny synthetic validation tests. For gated or local Llama3 checkpoints, see [docs/LLAMA3_VALIDATION.md](docs/LLAMA3_VALIDATION.md).
 - [Qwen3 dense](https://huggingface.co/docs/transformers/en/model_doc/qwen3)
+- [AFMoE dense-only](https://huggingface.co/docs/transformers/en/model_doc/afmoe)
+  - All decoder layers must use the dense MLP path (`num_dense_layers == num_hidden_layers`). Routed/shared experts and `mup_enabled=True` are intentionally rejected by the first implementation.
 
 ## Architecture-independent validation
 

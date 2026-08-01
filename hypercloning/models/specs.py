@@ -24,6 +24,7 @@ BUILTIN_CLONERS: tuple[ModelClonerSpec, ...] = (
     ModelClonerSpec("pythia", "transformers", "GPTNeoXConfig", "hypercloning.pythia_cloning", "clone_pythia"),
     ModelClonerSpec("qwen3", "transformers", "Qwen3Config", "hypercloning.qwen3_cloning", "clone_qwen3"),
     ModelClonerSpec("mixtral", "transformers", "MixtralConfig", "hypercloning.models.mixtral", "clone_mixtral"),
+    ModelClonerSpec("afmoe", "transformers", "AfmoeConfig", "hypercloning.models.afmoe", "clone_afmoe"),
     ModelClonerSpec("olmo", "hf_olmo.configuration_olmo", "OLMoConfig", "hypercloning.olmo_cloning", "clone_olmo"),
 )
 
