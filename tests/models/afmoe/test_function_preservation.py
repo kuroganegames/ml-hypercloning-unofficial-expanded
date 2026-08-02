@@ -12,7 +12,7 @@ from .helpers import afmoe_classes, force_eager, make_random_inputs, make_tiny_d
         (4, 2),  # MHA: KV heads stay equal to query heads.
     ],
 )
-def test_afmoe_dense_clone_preserves_tiny_logits_fp32(
+def test_afmoe_dense_clone_preserves_tiny_logits_and_hidden_states_fp32(
     num_key_value_heads,
     up_project_multiplier,
 ):
@@ -25,9 +25,10 @@ def test_afmoe_dense_clone_preserves_tiny_logits_fp32(
     src = AfmoeForCausalLM(config).eval()
     force_eager(src)
 
+    embedding_dim_multiplier = 2
     dst = cloneModel(
         src,
-        embedding_dim_multiplier=2,
+        embedding_dim_multiplier=embedding_dim_multiplier,
         up_project_multiplier=up_project_multiplier,
     ).eval()
     force_eager(dst)
@@ -41,7 +42,47 @@ def test_afmoe_dense_clone_preserves_tiny_logits_fp32(
 
     inputs = make_random_inputs(config, seq_len=12)
     with torch.inference_mode():
-        src_logits = src(**inputs, use_cache=False).logits
-        dst_logits = dst(**inputs, use_cache=False).logits
+        src_output = src(
+            **inputs,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+        dst_output = dst(
+            **inputs,
+            use_cache=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
 
-    torch.testing.assert_close(dst_logits, src_logits, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        dst_output.logits,
+        src_output.logits,
+        rtol=1e-4,
+        atol=1e-4,
+    )
+
+    assert src_output.hidden_states is not None
+    assert dst_output.hidden_states is not None
+    assert len(dst_output.hidden_states) == len(src_output.hidden_states)
+
+    for src_hidden, dst_hidden in zip(
+        src_output.hidden_states,
+        dst_output.hidden_states,
+        strict=True,
+    ):
+        assert dst_hidden.shape[:-1] == src_hidden.shape[:-1]
+        assert dst_hidden.shape[-1] == embedding_dim_multiplier * src_hidden.shape[-1]
+
+        repeated_blocks = dst_hidden.reshape(
+            *dst_hidden.shape[:-1],
+            embedding_dim_multiplier,
+            src_hidden.shape[-1],
+        )
+        for block in repeated_blocks.unbind(dim=-2):
+            torch.testing.assert_close(
+                block,
+                src_hidden,
+                rtol=1e-4,
+                atol=1e-4,
+            )
