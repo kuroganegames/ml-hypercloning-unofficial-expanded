@@ -54,6 +54,7 @@ The following families of models are currently supported:
 - [Qwen3 dense](https://huggingface.co/docs/transformers/en/model_doc/qwen3)
 - [AFMoE dense-only](https://huggingface.co/docs/transformers/en/model_doc/afmoe)
   - All decoder layers must use the dense MLP path (`num_dense_layers == num_hidden_layers`). Routed/shared experts and `mup_enabled=True` are intentionally rejected by the first implementation.
+  - See [docs/AFMOE_DENSE_VALIDATION.md](docs/AFMOE_DENSE_VALIDATION.md) for the support boundary, CPU/CUDA numerical contract, and real-checkpoint validation results.
 
 ## Architecture-independent validation
 
